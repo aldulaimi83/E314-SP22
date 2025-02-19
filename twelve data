@@ -1,0 +1,111 @@
+from fastapi import FastAPI, Request
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+import openai
+import yfinance as yf
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.pipeline import make_pipeline
+from sklearn.linear_model import LinearRegression
+import numpy as np
+import pandas as pd
+import os
+import plotly.graph_objects as go
+from datetime import timedelta, datetime
+
+# Initialize the FastAPI app
+app = FastAPI()
+
+# Set OpenAI API key (ensure it's set in environment variables)
+openai.api_key = os.getenv("OPENAI_API_KEY", "your-api-key-here")
+
+# Mount the static directory (for CSS, images, etc.)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Set up templates directory (for index.html)
+templates = Jinja2Templates(directory="templates")
+
+# Define Pydantic models for request payload validation
+class QueryRequest(BaseModel):
+    question: str
+
+class PredictRequest(BaseModel):
+    stock_symbol: str
+
+# Route to serve the homepage
+@app.get("/", response_class=HTMLResponse)
+async def read_root(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+# Stock market prediction endpoint
+@app.post("/predict")
+async def predict(request: PredictRequest):
+    try:
+        stock = request.stock_symbol.upper().strip()
+        # Fetch the last 6 months of daily data
+        data = yf.download(stock, period="6mo", interval="1d")
+
+        if data.empty:
+            return JSONResponse(content={"prediction": f"No data found for {stock}."}, status_code=400)
+
+        # Prepare the data
+        data = data.reset_index()
+        data["Day"] = np.arange(len(data))  # Add an index column
+
+        # Use the last 30 days for training
+        train_data = data.tail(30)
+
+        X = train_data["Day"].values.reshape(-1, 1)
+        y = train_data["Close"].values
+
+        # Use polynomial regression for better prediction
+        model = make_pipeline(PolynomialFeatures(degree=3), LinearRegression())
+        model.fit(X, y)
+
+        # Predict the next day's closing price
+        next_day_index = np.array([[data["Day"].iloc[-1] + 1]])
+        predicted_price = model.predict(next_day_index).item()
+
+        # Generate a candlestick chart
+        fig = go.Figure(data=[go.Candlestick(
+            x=train_data['Date'].dt.strftime("%Y-%m-%d"),
+            open=train_data['Open'],
+            high=train_data['High'],
+            low=train_data['Low'],
+            close=train_data['Close']
+        )])
+
+        # Predicted date
+        predicted_date = (train_data["Date"].iloc[-1] + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # Add a marker for the predicted price
+        fig.add_trace(go.Scatter(
+            x=[predicted_date],
+            y=[predicted_price],
+            mode='markers',
+            marker=dict(color='red', size=10),
+            name='Predicted Price'
+        ))
+
+        # Update chart layout
+        fig.update_layout(
+            title=f'{stock} - Last 30 Days Candlestick Chart with Prediction',
+            xaxis_title='Date',
+            yaxis_title='Price',
+            xaxis_rangeslider_visible=False
+        )
+
+        # Convert the chart to HTML
+        chart_html = fig.to_html(full_html=False)
+
+        prediction_text = f"The predicted closing price for {stock} on {predicted_date} is ${predicted_price:.2f}"
+        return {"prediction": prediction_text, "chart": chart_html}
+
+    except Exception as e:
+        return {"prediction": f"Error: {str(e)}"}
+
+# Run the app if executed directly
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
